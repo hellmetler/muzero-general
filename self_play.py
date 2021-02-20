@@ -162,6 +162,19 @@ class SelfPlay:
                         print(
                             f"Root value for player {self.game.to_play()}: {root.value():.2f}"
                         )
+
+                    # if action not in self.game.legal_actions():
+                    #     visit_counts = numpy.array([child.visit_count for child in root.children.values()])
+                    #     actions = numpy.array([action for action in root.children.keys()])
+                    #     legal_act_mask = numpy.isin(actions, self.game.legal_actions())
+                    #     visit_counts = visit_counts[legal_act_mask]
+                    #     actions = actions[legal_act_mask]
+                    #     # if (visit_counts!=0).any():
+                    #     #     p = visit_counts/visit_counts.sum()
+                    #     # else:
+                    #     if True:
+                    #         p = numpy.array([1. / visit_counts.shape[0]]*visit_counts.shape[0])
+                    #     action = numpy.random.choice(actions, p=p)
                 else:
                     action, root = self.select_opponent_action(
                         opponent, stacked_observations
@@ -462,6 +475,8 @@ class Node:
             torch.tensor([policy_logits[0][a] for a in actions]), dim=0
         ).tolist()
         policy = {a: policy_values[i] for i, a in enumerate(actions)}
+        # policy_values = torch.softmax(policy_logits[0], dim=0).tolist()
+        # policy = {i: p for i, p in enumerate(policy_values)}
         for action, p in policy.items():
             self.children[action] = Node(p)
 

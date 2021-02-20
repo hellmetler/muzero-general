@@ -14,11 +14,11 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 import diagnose_model
-import models
+import models_tf as models
 import replay_buffer
-import self_play
+import self_play_tf as self_play
 import shared_storage
-import trainer
+import trainer_tf as trainer
 
 
 class MuZero:
@@ -172,7 +172,7 @@ class MuZero:
                 num_cpus=0,
                 num_gpus=num_gpus_per_worker if self.config.selfplay_on_gpu else 0,
             ).remote(
-                self.checkpoint, self.Game, self.config, self.config.seed + seed,
+                self.checkpoint, self.Game, self.config, self.config.seed + seed
             )
             for seed in range(self.config.num_workers)
         ]
@@ -208,7 +208,7 @@ class MuZero:
             self.checkpoint,
             self.Game,
             self.config,
-            self.config.seed + self.config.num_workers,
+            self.config.seed + self.config.num_workers
         )
         self.test_worker.continuous_self_play.remote(
             self.shared_storage_worker, None, True
@@ -461,10 +461,10 @@ class CPUActor:
         pass
 
     def get_initial_weights(self, config):
-        model = models.MuZeroNetwork(config)
+        model = models.MuZeroNetwork(config, False)
         weigths = model.get_weights()
-        summary = str(model).replace("\n", " \n\n")
-        return weigths, summary
+        # summary = str(model).replace("\n", " \n\n")
+        return weigths, '_'
 
 
 def hyperparameter_search(

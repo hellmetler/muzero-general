@@ -1,12 +1,12 @@
 import copy
 import time
 
-import numpy
+import numpy as np
 import ray
-import torch
 
-import models
 
+import models_tf as models
+from models_tf import support_to_scalar
 
 @ray.remote
 class Trainer:
@@ -16,47 +16,58 @@ class Trainer:
     """
 
     def __init__(self, initial_checkpoint, config):
+        import tensorflow as tf
         self.config = config
 
         # Fix random generator seed
-        numpy.random.seed(self.config.seed)
-        torch.manual_seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        self.model = models.MuZeroNetwork(self.config, True)
 
-        # Initialize the network
-        self.model = models.MuZeroNetwork(self.config)
         self.model.set_weights(copy.deepcopy(initial_checkpoint["weights"]))
-        self.model.to(torch.device("cuda" if self.config.train_on_gpu else "cpu"))
-        self.model.train()
 
         self.training_step = initial_checkpoint["training_step"]
-
-        if "cuda" not in str(next(self.model.parameters()).device):
-            print("You are not training on GPU.\n")
-
-        # Initialize the optimizer
         if self.config.optimizer == "SGD":
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                lr=self.config.lr_init,
-                momentum=self.config.momentum,
-                weight_decay=self.config.weight_decay,
-            )
+            self.optimizer = tf.train.MomentumOptimizer(self.config.lr_init, self.config.momentum)
         elif self.config.optimizer == "Adam":
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(),
-                lr=self.config.lr_init,
-                weight_decay=self.config.weight_decay,
-            )
+            self.optimizer = tf.compat.v1.train.AdamOptimizer(self.config.lr_init)
+            self.optimizer_value = tf.compat.v1.train.AdamOptimizer(self.config.lr_init)
+            self.optimizer_reward = tf.compat.v1.train.AdamOptimizer(self.config.lr_init)
+            self.optimizer_policy = tf.compat.v1.train.AdamOptimizer(self.config.lr_init)
+
+            # self.optimizer = tf.compat.v1.train.RMSPropOptimizer(self.config.lr_init)
+            # self.optimizer = AdamW(lr = self.config.lr_init, weight_decay = self.config.weight_decay)
         else:
             raise NotImplementedError(
                 f"{self.config.optimizer} is not implemented. You can change the optimizer manually in trainer.py."
             )
+        self.support_size = self.model.support_size
+        self.sess = self.model.sess
+        self.image_ph = tf.placeholder(tf.float32, shape=[None, None, None, 3], name='image_ph')
+        self.actions_ph = tf.placeholder(tf.float32, shape=[None, self.config.num_unroll_steps + 1,
+                                                            self.model.num_actions], name='actions_ph')
+        self.target_value_ph = tf.placeholder(tf.float32, shape=[None, None, 1], name='value_ph')
+        self.target_reward_ph = tf.placeholder(tf.float32, shape=[None, None, 1], name='reward_ph')
+        self.target_policy_ph = tf.placeholder(tf.float32, shape=[None, None, self.model.num_actions],
+                                               name='policy_ph')
+        self.grad_scale_ph = tf.placeholder(tf.float32, shape=[None, None], name='grad_scale_ph')
+        self.PER_weights_ph = tf.placeholder(tf.float32, [None], name='PER_weights')
 
-        if initial_checkpoint["optimizer_state"] is not None:
-            print("Loading optimizer...\n")
-            self.optimizer.load_state_dict(
-                copy.deepcopy(initial_checkpoint["optimizer_state"])
-            )
+        [self.priorities,
+         self.total_loss,
+         self.value_loss,
+         self.reward_loss,
+         self.policy_loss,
+         self.make_train_step,
+         # self.make_train_step_value,
+         # self.make_train_step_reward,
+         # self.make_train_step_policy
+         ] = self.train_symbolic(self.image_ph, self.actions_ph, self.target_value_ph,
+                                                     self.target_reward_ph, self.target_policy_ph, self.PER_weights_ph,
+                                                     self.grad_scale_ph)
+        tmp_w = self.model.get_weights()
+        self.sess.run(tf.compat.v1.global_variables_initializer())
+        self.model.set_weights(tmp_w)
+
 
     def continuous_update_weights(self, replay_buffer, shared_storage):
         # Wait for the replay buffer to be filled
@@ -70,41 +81,70 @@ class Trainer:
         ):
             index_batch, batch = ray.get(next_batch)
             next_batch = replay_buffer.get_batch.remote()
-            self.update_lr()
-            (
-                priorities,
-                total_loss,
-                value_loss,
-                reward_loss,
-                policy_loss,
-            ) = self.update_weights(batch)
+            # self.update_lr()
+            image, actions, target_value, target_reward, target_policy, per_weights, grad_scale = batch
+            image = np.asarray(image)
+            actions = np.asarray(actions)
+            target_value = np.asarray(target_value)
+            target_reward = np.asarray(target_reward)
+            target_policy = np.asarray(target_policy)
+            per_weights = np.asarray(per_weights)
+            grad_scale = np.asarray(grad_scale)
+
+            inp_img = image#np.transpose(image, [0, 2, 3, 1])
+            actions_ohe = np.array(actions).astype(float)/self.model.num_actions
+            actions_ohe = np.expand_dims(actions_ohe,axis = -1)
+            actions_ohe = np.repeat(actions_ohe, self.model.num_actions,axis=-1)
+            if not self.config.PER:
+                per_weights = np.ones(image.shape[0])
+            inp_dict = {self.image_ph:inp_img,
+                        self.actions_ph:actions_ohe,
+                        self.target_value_ph: np.expand_dims(target_value,axis = -1),
+                        self.target_reward_ph: np.expand_dims(target_reward,axis = -1),
+                        self.target_policy_ph:target_policy,
+                        self.PER_weights_ph:per_weights,
+                        self.grad_scale_ph:grad_scale}
+            # _ = self.sess.run([self.make_train_step_value], inp_dict)
+            # _ = self.sess.run([self.make_train_step_reward], inp_dict)
+            # _ = self.sess.run([self.make_train_step_policy], inp_dict)
+            # priorities, total_loss, value_loss, reward_loss, policy_loss = self.sess.run([self.priorities,
+            #                                                                                  self.total_loss,
+            #                                                                                  self.value_loss,
+            #                                                                                  self.reward_loss,
+            #                                                                                  self.policy_loss],
+            #                                                                                 inp_dict)
+            priorities, total_loss, value_loss, reward_loss, policy_loss, _ = self.sess.run([self.priorities,
+                                                                                                    self.total_loss,
+                                                                                                    self.value_loss,
+                                                                                                    self.reward_loss,
+                                                                                                    self.policy_loss,
+                                                                                                    self.make_train_step],
+                                                                                                    inp_dict)
+            self.training_step += 1
 
             if self.config.PER:
                 # Save new priorities in the replay buffer (See https://arxiv.org/abs/1803.00933)
                 replay_buffer.update_priorities.remote(priorities, index_batch)
 
             # Save to the shared storage
-            if self.training_step % self.config.checkpoint_interval == 0:
-                shared_storage.set_info.remote(
-                    {
+            info_to_storage = ray.put({
                         "weights": copy.deepcopy(self.model.get_weights()),
-                        "optimizer_state": copy.deepcopy(
-                            models.dict_to_cpu(self.optimizer.state_dict())
-                        ),
-                    }
-                )
+                        "optimizer_state": None#copy.deepcopy(models.dict_to_cpu(self.optimizer.state_dict())),
+                    })
+            if self.training_step % self.config.checkpoint_interval == 0:
+                shared_storage.set_info.remote(info_to_storage)
                 if self.config.save_model:
                     shared_storage.save_checkpoint.remote()
-            shared_storage.set_info.remote(
-                {
+
+            info_to_storage = ray.put({
                     "training_step": self.training_step,
-                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "lr": self.config.lr_init,#self.optimizer.param_groups[0]["lr"],
                     "total_loss": total_loss,
                     "value_loss": value_loss,
                     "reward_loss": reward_loss,
                     "policy_loss": policy_loss,
-                }
-            )
+                })
+            shared_storage.set_info.remote(info_to_storage)
 
             # Managing the self-play / training ratio
             if self.config.training_delay:
@@ -121,178 +161,398 @@ class Trainer:
                 ):
                     time.sleep(0.5)
 
-    def update_weights(self, batch):
-        """
-        Perform one training step.
-        """
 
-        (
-            observation_batch,
-            action_batch,
-            target_value,
-            target_reward,
-            target_policy,
-            weight_batch,
-            gradient_scale_batch,
-        ) = batch
+    # def train_symbolic(self, image,actions, target_value,target_reward,target_policy,per_weights,grad_scale):
+    #     import tensorflow as tf
+    #     # Initial step, from the real observation.
+    #
+    #     # hidden_state, policy_logits, value = self.model.initial_inference_symbolic(image, training=True)
+    #     hidden_state = self.model.representation_model(image, training=True)
+    #     hidden_state = self.model.normalize_representation(hidden_state)
+    #     policy_logits, value = self.model.prediction_model(hidden_state, training=True)
+    #     # predictions = [(1.0, value, reward, policy_logits)]
+    #     pred_values = [value]
+    #     pred_rewards = []
+    #     pred_policy_logits = [policy_logits]
+    #
+    #     # Recurrent steps, from action and previous hidden state.
+    #
+    #     for i in range(1, self.config.num_unroll_steps+1):
+    #         action_reshaped = tf.reshape(actions[:, i, :], shape=(-1, 1, 3, 3))
+    #         dynam_inp = tf.concat(values=[hidden_state, action_reshaped], axis=1)
+    #         hidden_state, reward = self.model.dynamics_model(dynam_inp, training=True)
+    #         hidden_state = self.model.normalize_representation(hidden_state)
+    #         policy_logits, value = self.model.prediction_model(hidden_state, training=True)
+    #         # hidden_state, reward, policy_logits, value = self.model.recurrent_inference_symbolic(
+    #         #                                                     hidden_state,
+    #         #                                                     actions[:, i, :], training=True)
+    #         hidden_state = self.scale_gradient(hidden_state, 0.5)
+    #
+    #         pred_values.append(value)
+    #         pred_rewards.append(reward)
+    #         pred_policy_logits.append(policy_logits)
+    #
+    #
+    #     target_value_scalar = target_value
+    #     target_value = scalar_to_support(target_value, self.support_size)
+    #     target_reward = scalar_to_support(target_reward, self.support_size)
+    #
+    #     pred_values = tf.stack(pred_values, axis=1)
+    #     pred_rewards = tf.stack(pred_rewards, axis=1)
+    #     pred_policy_logits = tf.stack(pred_policy_logits, axis=1)
+    #
+    #     priority = tf.pow(tf.abs(support_to_scalar(pred_values, self.support_size) - target_value_scalar),
+    #                       self.config.PER_alpha)
+    #
+    #     grad_scale_cur = 1. / grad_scale
+    #
+    #     value_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=pred_values, labels=target_value)
+    #     value_loss_0 = value_loss[:, :1]
+    #     value_loss = self.scale_gradient(value_loss[:, 1:], grad_scale_cur[:, 1:])
+    #     value_loss = tf.concat(values=[value_loss_0, value_loss], axis=1)
+    #     value_loss = tf.reduce_sum(value_loss, axis=1)
+    #
+    #     policy_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=pred_policy_logits, labels=target_policy)
+    #     policy_loss_0 = policy_loss[:, :1]
+    #     policy_loss = self.scale_gradient(policy_loss[:, 1:], grad_scale_cur[:, 1:])
+    #     policy_loss = tf.concat(values=[policy_loss_0, policy_loss], axis=1)
+    #     policy_loss = tf.reduce_sum(policy_loss, axis=1)
+    #
+    #     reward_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=pred_rewards, labels=target_reward[:, 1:, :])
+    #     reward_loss = self.scale_gradient(reward_loss, grad_scale_cur[:, 1:])
+    #     reward_loss = tf.reduce_sum(reward_loss, axis=1)
+    #
+    #     loss = self.config.value_loss_weight * value_loss + reward_loss + policy_loss
+    #
+    #     if self.config.PER:
+    #         # Correct PER bias by using importance-sampling (IS) weights
+    #         loss *= per_weights
+    #
+    #     loss = tf.reduce_mean(loss)
+    #
+    #     loss_value = tf.reduce_mean(self.config.value_loss_weight * value_loss)
+    #     loss_reward = tf.reduce_mean(reward_loss)
+    #     loss_policy = tf.reduce_mean(policy_loss)
+    #
+    #     params = (self.model.representation_model.trainable_weights +
+    #               self.model.prediction_model.trainable_weights +
+    #               self.model.dynamics_model.trainable_weights)
+    #
+    #     gvs = self.optimizer_value.compute_gradients(loss_value)
+    #     reg_gvs = [(grad + self.config.weight_decay * var, var) for grad, var in gvs if
+    #                ((var in params)  # and ('bias' not in var.name)
+    #                                  )]        # capped_gvs = [(tf.clip_by_norm(grad, 0.1), var) for grad, var in gvs]
+    #     step_value = self.optimizer_value.apply_gradients(reg_gvs)
+    #
+    #     gvs = self.optimizer_value.compute_gradients(loss_reward)
+    #     reg_gvs = [(grad + self.config.weight_decay * var, var) for grad, var in gvs if
+    #                ((var in params)  # and ('bias' not in var.name)
+    #                                  )]        # capped_gvs = [(tf.clip_by_norm(grad, 0.1), var) for grad, var in gvs]
+    #     step_reward = self.optimizer_reward.apply_gradients(reg_gvs)
+    #
+    #     gvs = self.optimizer_value.compute_gradients(loss_policy)
+    #     reg_gvs = [(grad + self.config.weight_decay * var, var) for grad, var in gvs if
+    #                ((var in params)# and ('bias' not in var.name)
+    #                 )]
+    #     # capped_gvs = [(tf.clip_by_norm(grad, 0.1), var) for grad, var in gvs]
+    #     step_policy = self.optimizer_policy.apply_gradients(reg_gvs)
+    #
+    #     # for i, weights in enumerate(tf.trainable_variables()):
+    #     #     # if 'bias' not in weights.name:
+    #     #     if i ==0:
+    #     #         w_loss = tf.nn.l2_loss(weights)
+    #     #     else:
+    #     #         w_loss += tf.nn.l2_loss(weights)
+    #         # vars.append(weights)
+    #     #
+    #     # loss_reg = loss + self.config.weight_decay * w_loss
+    #
+    #     params = (self.model.representation_model.trainable_weights +
+    #               self.model.prediction_model.trainable_weights +
+    #               self.model.dynamics_model.trainable_weights)
+    #
+    #     gvs = self.optimizer.compute_gradients(loss)
+    #     reg_gvs = [(grad + self.config.weight_decay * var, var) for grad, var in gvs if ((var in params)
+    #                                                                                      # and ('bias' not in var.name)
+    #                                                                                      )]
+    #     # capped_gvs = [(tf.clip_by_norm(grad, 0.1), var) for grad, var in gvs]
+    #     train_step = self.optimizer.apply_gradients(reg_gvs)
+    #
+    #
+    #     # train_step = self.optimizer.minimize(loss_reg)
+    #     # train_step = self.optimizer.minimize(loss, tf.trainable_variables())
+    #
+    #
+    #     return [priority, tf.reduce_mean(loss), tf.reduce_mean(value_loss), tf.reduce_mean(reward_loss), tf.reduce_mean(policy_loss),
+    #             train_step, step_value, step_reward, step_policy]
 
-        # Keep values as scalars for calculating the priorities for the prioritized replay
-        target_value_scalar = numpy.array(target_value, dtype="float32")
-        priorities = numpy.zeros_like(target_value_scalar)
 
-        device = next(self.model.parameters()).device
-        if self.config.PER:
-            weight_batch = torch.tensor(weight_batch.copy()).float().to(device)
-        observation_batch = torch.tensor(observation_batch).float().to(device)
-        action_batch = torch.tensor(action_batch).long().to(device).unsqueeze(-1)
-        target_value = torch.tensor(target_value).float().to(device)
-        target_reward = torch.tensor(target_reward).float().to(device)
-        target_policy = torch.tensor(target_policy).float().to(device)
-        gradient_scale_batch = torch.tensor(gradient_scale_batch).float().to(device)
-        # observation_batch: batch, channels, height, width
-        # action_batch: batch, num_unroll_steps+1, 1 (unsqueeze)
-        # target_value: batch, num_unroll_steps+1
-        # target_reward: batch, num_unroll_steps+1
-        # target_policy: batch, num_unroll_steps+1, len(action_space)
-        # gradient_scale_batch: batch, num_unroll_steps+1
+    def train_symbolic(self, image,actions, target_value,target_reward,target_policy,per_weights,grad_scale):
+        import tensorflow as tf
+        # Initial step, from the real observation.
 
-        target_value = models.scalar_to_support(target_value, self.config.support_size)
-        target_reward = models.scalar_to_support(
-            target_reward, self.config.support_size
-        )
-        # target_value: batch, num_unroll_steps+1, 2*support_size+1
-        # target_reward: batch, num_unroll_steps+1, 2*support_size+1
+        # hidden_state, policy_logits, value = self.model.initial_inference_symbolic(image, training=True)
+        hidden_state = self.model.representation_model(image, training=True)
+        hidden_state = self.model.normalize_representation(hidden_state)
+        policy_logits, value = self.model.prediction_model(hidden_state, training=True)
+        # predictions = [(1.0, value, reward, policy_logits)]
+        pred_values = [value]
+        pred_rewards = []
+        pred_policy_logits = [policy_logits]
 
-        ## Generate predictions
-        value, reward, policy_logits, hidden_state = self.model.initial_inference(
-            observation_batch
-        )
-        predictions = [(value, reward, policy_logits)]
-        for i in range(1, action_batch.shape[1]):
-            value, reward, policy_logits, hidden_state = self.model.recurrent_inference(
-                hidden_state, action_batch[:, i]
-            )
-            # Scale the gradient at the start of the dynamics function (See paper appendix Training)
-            hidden_state.register_hook(lambda grad: grad * 0.5)
-            predictions.append((value, reward, policy_logits))
-        # predictions: num_unroll_steps+1, 3, batch, 2*support_size+1 | 2*support_size+1 | 9 (according to the 2nd dim)
+        # Recurrent steps, from action and previous hidden state.
 
-        ## Compute losses
-        value_loss, reward_loss, policy_loss = (0, 0, 0)
-        value, reward, policy_logits = predictions[0]
+        for i in range(1, self.config.num_unroll_steps+1):
+            action_reshaped = tf.reshape(actions[:, i, :], shape=(-1, 1, 3, 3))
+            dynam_inp = tf.concat(values=[hidden_state, action_reshaped], axis=1)
+            hidden_state, reward = self.model.dynamics_model(dynam_inp, training=True)
+            hidden_state = self.model.normalize_representation(hidden_state)
+            policy_logits, value = self.model.prediction_model(hidden_state, training=True)
+            # hidden_state, reward, policy_logits, value = self.model.recurrent_inference_symbolic(
+            #                                                     hidden_state,
+            #                                                     actions[:, i, :], training=True)
+            hidden_state = self.scale_gradient(hidden_state, 0.5)
+
+            pred_values.append(value)
+            pred_rewards.append(reward)
+            pred_policy_logits.append(policy_logits)
+
+
+        target_value_scalar = target_value
+        target_value = scalar_to_support(target_value, self.support_size)
+        target_reward = scalar_to_support(target_reward, self.support_size)
+
+        value, policy_logits = pred_values[0],pred_policy_logits[0]
         # Ignore reward loss for the first batch step
-        current_value_loss, _, current_policy_loss = self.loss_function(
-            value.squeeze(-1),
-            reward.squeeze(-1),
-            policy_logits,
-            target_value[:, 0],
-            target_reward[:, 0],
-            target_policy[:, 0],
-        )
-        value_loss += current_value_loss
-        policy_loss += current_policy_loss
+        current_value_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=value, labels=target_value[:,0,:])
+        current_policy_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=policy_logits, labels=target_policy[:,0,:])
+
+        value_loss = current_value_loss
+        policy_loss = current_policy_loss
+
+        priorities = []
         # Compute priorities for the prioritized replay (See paper appendix Training)
-        pred_value_scalar = (
-            models.support_to_scalar(value, self.config.support_size)
-            .detach()
-            .cpu()
-            .numpy()
-            .squeeze()
-        )
-        priorities[:, 0] = (
-            numpy.abs(pred_value_scalar - target_value_scalar[:, 0])
-            ** self.config.PER_alpha
-        )
+        priority = tf.pow(tf.abs(support_to_scalar(value, self.support_size) - target_value_scalar[:, 0, :]),
+                          self.config.PER_alpha)
+        priorities.append(priority)
 
-        for i in range(1, len(predictions)):
-            value, reward, policy_logits = predictions[i]
-            (
-                current_value_loss,
-                current_reward_loss,
-                current_policy_loss,
-            ) = self.loss_function(
-                value.squeeze(-1),
-                reward.squeeze(-1),
-                policy_logits,
-                target_value[:, i],
-                target_reward[:, i],
-                target_policy[:, i],
-            )
 
+        for i in range(1, self.config.num_unroll_steps+1):
+            value, reward, policy_logits = pred_values[i], pred_rewards[i-1], pred_policy_logits[i]
+
+            current_value_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=value, labels=target_value[:, i, :])
+            current_reward_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=reward, labels=target_reward[:, i, :])
+            current_policy_loss = tf.nn.softmax_cross_entropy_with_logits_v2(logits=policy_logits,
+                                                                          labels=target_policy[:, i, :])
             # Scale gradient by the number of unroll steps (See paper appendix Training)
-            current_value_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            current_reward_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            current_policy_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
+
+            grad_scale_cur = 1./grad_scale[:,i]
+            current_value_loss = self.scale_gradient(current_value_loss, grad_scale_cur)
+            current_reward_loss = self.scale_gradient(current_reward_loss, grad_scale_cur)
+            current_policy_loss = self.scale_gradient(current_policy_loss, grad_scale_cur)
 
             value_loss += current_value_loss
-            reward_loss += current_reward_loss
+            if i ==1:
+                reward_loss = current_reward_loss
+            else:
+                reward_loss += current_reward_loss
             policy_loss += current_policy_loss
 
-            # Compute priorities for the prioritized replay (See paper appendix Training)
-            pred_value_scalar = (
-                models.support_to_scalar(value, self.config.support_size)
-                .detach()
-                .cpu()
-                .numpy()
-                .squeeze()
-            )
-            priorities[:, i] = (
-                numpy.abs(pred_value_scalar - target_value_scalar[:, i])
-                ** self.config.PER_alpha
-            )
+            priority = tf.pow(tf.abs(support_to_scalar(value, self.support_size) - target_value_scalar[:,i,:]),
+                              self.config.PER_alpha)
+            priorities.append(priority)
 
-        # Scale the value loss, paper recommends by 0.25 (See paper appendix Reanalyze)
-        loss = value_loss * self.config.value_loss_weight + reward_loss + policy_loss
+        priority = tf.stack(priorities,axis = 1)
+        loss = self.config.value_loss_weight*value_loss+reward_loss+policy_loss
+
+
         if self.config.PER:
             # Correct PER bias by using importance-sampling (IS) weights
-            loss *= weight_batch
-        # Mean over batch dimension (pseudocode do a sum)
-        loss = loss.mean()
+            loss *= per_weights
 
-        # Optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.training_step += 1
+        loss = tf.reduce_mean(loss)
 
-        return (
-            priorities,
-            # For log purpose
-            loss.item(),
-            value_loss.mean().item(),
-            reward_loss.mean().item(),
-            policy_loss.mean().item(),
-        )
+        # vars = []
 
-    def update_lr(self):
-        """
-        Update learning rate
-        """
-        lr = self.config.lr_init * self.config.lr_decay_rate ** (
-            self.training_step / self.config.lr_decay_steps
-        )
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
 
-    @staticmethod
-    def loss_function(
-        value,
-        reward,
-        policy_logits,
-        target_value,
-        target_reward,
-        target_policy,
-    ):
-        # Cross-entropy seems to have a better convergence than MSE
-        value_loss = (-target_value * torch.nn.LogSoftmax(dim=1)(value)).sum(1)
-        reward_loss = (-target_reward * torch.nn.LogSoftmax(dim=1)(reward)).sum(1)
-        policy_loss = (-target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits)).sum(
-            1
-        )
-        return value_loss, reward_loss, policy_loss
+
+        # for i, weights in enumerate(tf.trainable_variables()):
+        #     # if 'bias' not in weights.name:
+        #     if i ==0:
+        #         w_loss = tf.nn.l2_loss(weights)
+        #     else:
+        #         w_loss += tf.nn.l2_loss(weights)
+            # vars.append(weights)
+        #
+        # loss_reg = loss + self.config.weight_decay * w_loss
+
+        params = (self.model.representation_model.trainable_weights +
+                  self.model.prediction_model.trainable_weights +
+                  self.model.dynamics_model.trainable_weights)
+
+        gvs = self.optimizer.compute_gradients(loss)
+        reg_gvs = [(grad + self.config.weight_decay * var, var) for grad, var in gvs if ((var in params)
+                                                                                         and ('bias' not in var.name)
+                                                                                         )]
+        # capped_gvs = [(tf.clip_by_norm(grad, 0.1), var) for grad, var in gvs]
+        train_step = self.optimizer.apply_gradients(reg_gvs)
+
+
+        # train_step = self.optimizer.minimize(loss_reg)
+        # train_step = self.optimizer.minimize(loss, tf.trainable_variables())
+
+
+        return [priority, tf.reduce_mean(loss), tf.reduce_mean(value_loss), tf.reduce_mean(reward_loss), tf.reduce_mean(policy_loss), train_step]
+
+    def scale_gradient(self,x,scale):
+        import tensorflow as tf
+        """Scales the gradient for the backward pass."""
+        return x * scale + tf.stop_gradient(x) * tf.stop_gradient(1 - scale)
+
+def loss_function_2(x_pred,target_x):
+    import tensorflow as tf
+    # Cross-entropy seems to have a better convergence than MSE
+    loss = tf.reduce_sum((-target_x * tf.nn.log_softmax(x_pred,axis= -1)),axis = -1)
+    # reward_pred = K.clip(reward_pred, 1e-5, 1-(1e-5))
+    # loss = tf.reduce_sum(-(target_reward*tf.log(reward_pred)+(1.-target_reward)*tf.log(1.-reward_pred)),
+    #                      axis=-1)
+    return loss
+
+def scalar_to_support(x, support_size):
+    import tensorflow as tf
+    """
+    Transform a scalar to a categorical representation with (2 * support_size + 1) categories
+    See paper appendix Network Architecture
+    """
+    support_size = int(support_size)
+    # Reduce the scale (defined in https://arxiv.org/abs/1805.11593)
+    x = tf.sign(x) * (tf.sqrt(tf.abs(x) + 1) - 1) + 0.001*x
+
+    # Encode on a vector
+    x = tf.keras.backend.clip(x, -support_size, support_size)
+    floor = tf.floor(x)
+    prob = x - floor
+    shape = tf.shape(x)
+    logits = tf.zeros((shape[0], shape[1], 2 * support_size + 1))
+
+    idxes = tf.constant(np.arange(support_size*2+1,dtype = np.int32))
+
+    ids = tf.reshape(tf.cast(idxes,tf.int32),(1,1,-1))
+
+    ids_to_fill = (floor + support_size)
+    fill_mask = tf.cast(tf.equal(ids,tf.cast(ids_to_fill,tf.int32)),tf.float32)
+    logits = (1 - prob) * fill_mask + logits * (1 - fill_mask)
+
+
+    ids_to_fill = (floor + support_size + 1)
+    mask = tf.cast(tf.less(2 * support_size, tf.cast(ids_to_fill,tf.int32)),tf.float32)
+    prob = prob*(1-mask)
+    ids_to_fill = ids_to_fill*(1-mask)
+    fill_mask = tf.cast(tf.equal(ids, tf.cast(ids_to_fill, tf.int32)), tf.float32)
+    logits = prob * fill_mask + logits * (1 - fill_mask)
+
+    return logits
+
+
+# from tensorflow.python.ops import control_flow_ops
+# from tensorflow.python.ops import state_ops
+# from tensorflow.python.framework import ops
+# from tensorflow.python.training import optimizer
+#
+#
+# class AdamW(optimizer.Optimizer):
+#
+#     def __init__(self, lr=0.001, beta_1=0.9, beta_2=0.999,
+#                  epsilon=1e-8, decay=0., weight_decay=0.025,
+#                  batch_size=1, samples_per_epoch=1,
+#                  epochs=1, use_locking=False, name="adamw"):
+#         super(AdamW, self).__init__(use_locking, name)
+#         self.lr = lr
+#         self.beta_1 = beta_1
+#         self.beta_2 = beta_2
+#         self.decay = decay
+#         self.weight_decay = weight_decay
+#         self.batch_size = batch_size
+#         self.epsilon = epsilon
+#         self.samples_per_epoch = samples_per_epoch
+#         self.epochs = epochs
+#         self.initial_decay = decay
+#
+#         # Tensor versions of the constructor arguments, created in _prepare().
+#         self._lr_t = None
+#         self._beta_1_t = None
+#         self._beta_2_t = None
+#         self._decay_t = None
+#         self._weight_decay_t = None
+#         self._batch_size_t = None
+#         self._epsilon_t = None
+#         self._samples_per_epoch_t = None
+#         self._epochs_t = None
+#         self._initial_decay_t = None
+#
+#         self.iterations = 0
+#
+#     def _prepare(self):
+#         self._lr_t = ops.convert_to_tensor(self.lr, name="learning_rate")
+#         self._beta_1_t = ops.convert_to_tensor(self.beta_1, name="_beta_1_t")
+#         self._beta_2_t = ops.convert_to_tensor(self.beta_2, name="_beta_1_t")
+#         # self._decay_t = ops.convert_to_tensor(self._decay, name="_beta_1_t")
+#         self._weight_decay_t = ops.convert_to_tensor(self.weight_decay, name="_beta_1_t")
+#         self._epsilon_t = ops.convert_to_tensor(self.epsilon, name="_beta_1_t")
+#         # self._samples_per_epoch_t = ops.convert_to_tensor(self.samples_per_epoch, name="_beta_1_t")
+#         # self._epochs_t = ops.convert_to_tensor(self.epochs, name="_beta_1_t")
+#         # self._initial_decay_t = ops.convert_to_tensor(self._initial_decay, name="_beta_1_t")
+#
+#
+#     def _create_slots(self, var_list):
+#         # Create slots for the first and second moments.
+#         for v in var_list:
+#             self._zeros_slot(v, "vs", self._name)
+#             self._zeros_slot(v, "ms", self._name)
+#
+#     def _resource_apply_dense(self, grad, var):
+#         # self.iterations = 0#+=1
+#         # t =self.iterations + 1
+#         lr = self.lr
+#         if self.initial_decay > 0:
+#             lr = lr * (1. / (1. + self.decay * self.iterations))
+#         t = self.iterations+1
+#         lr_t = lr * (tf.keras.backend.sqrt(1. - tf.keras.backend.pow(self.beta_2, t)) /
+#                      (1. - tf.keras.backend.pow(self.beta_1, t)))
+#
+#         # lr_t = math_ops.cast(lr, var.dtype.base_dtype)
+#
+#
+#
+#         eps = 1e-7  # cap for moving average
+#
+#         m = self.get_slot(var, "ms")
+#         v = self.get_slot(var, "vs")
+#
+#         grad = grad + self.weight_decay * var
+#         m_t = (self.beta_1 * m) + (1. - self.beta_1) * grad
+#         v_t = (self.beta_2 * v) + (1. - self.beta_2) * tf.keras.backend.square(grad)
+#
+#         tf.keras.backend.update(m, m_t)
+#         tf.keras.backend.update(v, v_t)
+#
+#         eta_t = 1.
+#
+#         upd = eta_t * (lr_t * m_t / (tf.keras.backend.sqrt(v_t) + self.epsilon))
+#         # p_t = var -
+#         # w_d = self.weight_decay * tf.keras.backend.sqrt(self.batch_size_t / (self.samples_per_epoch_t * self.epochs))
+#         w_d = self.weight_decay# * np.sqrt(self.batch_size / (self.samples_per_epoch * self.epochs))
+#         # p_t = p_t - eta_t * (w_d * var)
+#         # if 'bias' not in var.name:
+#         # upd = upd + eta_t * w_d * var
+#
+#
+#
+#         var_update = state_ops.assign_sub(var, upd)
+#         # Create an op that groups multiple operations
+#         # When this op finishes, all ops in input have finished
+#         return var_update#control_flow_ops.group(*[var_update, m_t, v_t])
+#
+#
+#     def _apply_sparse(self, grad, var):
+#         raise NotImplementedError("Sparse gradient updates are not supported.")

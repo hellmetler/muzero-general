@@ -1,25 +1,11 @@
 import math
 from abc import ABC, abstractmethod
 
-import torch
-
+# import ray.experimental.tf_utils as rtfu
+import numpy as np
 
 class MuZeroNetwork:
-    def __new__(cls, config):
-        if config.network == "fullyconnected":
-            return MuZeroFullyConnectedNetwork(
-                config.observation_shape,
-                config.stacked_observations,
-                len(config.action_space),
-                config.encoding_size,
-                config.fc_reward_layers,
-                config.fc_value_layers,
-                config.fc_policy_layers,
-                config.fc_representation_layers,
-                config.fc_dynamics_layers,
-                config.support_size,
-            )
-        elif config.network == "resnet":
+    def __new__(cls, config, training):
             return MuZeroResidualNetwork(
                 config.observation_shape,
                 config.stacked_observations,
@@ -34,652 +20,370 @@ class MuZeroNetwork:
                 config.resnet_fc_policy_layers,
                 config.support_size,
                 config.downsample,
-            )
-        else:
-            raise NotImplementedError(
-                'The network parameter should be "fullyconnected" or "resnet".'
-            )
-
-
-def dict_to_cpu(dictionary):
-    cpu_dict = {}
-    for key, value in dictionary.items():
-        if isinstance(value, torch.Tensor):
-            cpu_dict[key] = value.cpu()
-        elif isinstance(value, dict):
-            cpu_dict[key] = dict_to_cpu(value)
-        else:
-            cpu_dict[key] = value
-    return cpu_dict
-
-
-class AbstractNetwork(ABC, torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        pass
-
-    @abstractmethod
-    def initial_inference(self, observation):
-        pass
-
-    @abstractmethod
-    def recurrent_inference(self, encoded_state, action):
-        pass
-
-    def get_weights(self):
-        return dict_to_cpu(self.state_dict())
-
-    def set_weights(self, weights):
-        self.load_state_dict(weights)
-
-
-##################################
-######## Fully Connected #########
-
-
-class MuZeroFullyConnectedNetwork(AbstractNetwork):
-    def __init__(
-        self,
-        observation_shape,
-        stacked_observations,
-        action_space_size,
-        encoding_size,
-        fc_reward_layers,
-        fc_value_layers,
-        fc_policy_layers,
-        fc_representation_layers,
-        fc_dynamics_layers,
-        support_size,
-    ):
-        super().__init__()
-        self.action_space_size = action_space_size
-        self.full_support_size = 2 * support_size + 1
-
-        self.representation_network = torch.nn.DataParallel(
-            mlp(
-                observation_shape[0]
-                * observation_shape[1]
-                * observation_shape[2]
-                * (stacked_observations + 1)
-                + stacked_observations * observation_shape[1] * observation_shape[2],
-                fc_representation_layers,
-                encoding_size,
-            )
-        )
-
-        self.dynamics_encoded_state_network = torch.nn.DataParallel(
-            mlp(
-                encoding_size + self.action_space_size,
-                fc_dynamics_layers,
-                encoding_size,
-            )
-        )
-        self.dynamics_reward_network = torch.nn.DataParallel(
-            mlp(encoding_size, fc_reward_layers, self.full_support_size)
-        )
-
-        self.prediction_policy_network = torch.nn.DataParallel(
-            mlp(encoding_size, fc_policy_layers, self.action_space_size)
-        )
-        self.prediction_value_network = torch.nn.DataParallel(
-            mlp(encoding_size, fc_value_layers, self.full_support_size)
-        )
-
-    def prediction(self, encoded_state):
-        policy_logits = self.prediction_policy_network(encoded_state)
-        value = self.prediction_value_network(encoded_state)
-        return policy_logits, value
-
-    def representation(self, observation):
-        encoded_state = self.representation_network(
-            observation.view(observation.shape[0], -1)
-        )
-        # Scale encoded state between [0, 1] (See appendix paper Training)
-        min_encoded_state = encoded_state.min(1, keepdim=True)[0]
-        max_encoded_state = encoded_state.max(1, keepdim=True)[0]
-        scale_encoded_state = max_encoded_state - min_encoded_state
-        scale_encoded_state[scale_encoded_state < 1e-5] += 1e-5
-        encoded_state_normalized = (
-            encoded_state - min_encoded_state
-        ) / scale_encoded_state
-        return encoded_state_normalized
-
-    def dynamics(self, encoded_state, action):
-        # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)
-        action_one_hot = (
-            torch.zeros((action.shape[0], self.action_space_size))
-            .to(action.device)
-            .float()
-        )
-        action_one_hot.scatter_(1, action.long(), 1.0)
-        x = torch.cat((encoded_state, action_one_hot), dim=1)
-
-        next_encoded_state = self.dynamics_encoded_state_network(x)
-
-        reward = self.dynamics_reward_network(next_encoded_state)
-
-        # Scale encoded state between [0, 1] (See paper appendix Training)
-        min_next_encoded_state = next_encoded_state.min(1, keepdim=True)[0]
-        max_next_encoded_state = next_encoded_state.max(1, keepdim=True)[0]
-        scale_next_encoded_state = max_next_encoded_state - min_next_encoded_state
-        scale_next_encoded_state[scale_next_encoded_state < 1e-5] += 1e-5
-        next_encoded_state_normalized = (
-            next_encoded_state - min_next_encoded_state
-        ) / scale_next_encoded_state
-
-        return next_encoded_state_normalized, reward
-
-    def initial_inference(self, observation):
-        encoded_state = self.representation(observation)
-        policy_logits, value = self.prediction(encoded_state)
-        # reward equal to 0 for consistency
-        reward = torch.log(
-            (
-                torch.zeros(1, self.full_support_size)
-                .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
-                .repeat(len(observation), 1)
-                .to(observation.device)
-            )
-        )
-
-        return (
-            value,
-            reward,
-            policy_logits,
-            encoded_state,
-        )
-
-    def recurrent_inference(self, encoded_state, action):
-        next_encoded_state, reward = self.dynamics(encoded_state, action)
-        policy_logits, value = self.prediction(next_encoded_state)
-        return value, reward, policy_logits, next_encoded_state
-
-
-###### End Fully Connected #######
-##################################
-
+                training)
 
 ##################################
 ############# ResNet #############
+class MuZeroResidualNetwork:
+    def __init__(self,
+                 observation_shape,
+                 stacked_observations,
+                 action_space_size,
+                 num_blocks,
+                 num_channels,
+                 reduced_channels_reward,
+                 reduced_channels_value,
+                 reduced_channels_policy,
+                 fc_reward_layers,
+                 fc_value_layers,
+                 fc_policy_layers,
+                 support_size,
+                 downsample,
+                 training
+                 ):
+        import tensorflow as tf
+
+        sess = tf.get_default_session()
+        if sess is not None:
+            self.sess = sess
+        else:
+            self.sess = tf.compat.v1.InteractiveSession()
+
+        self.num_channels = num_channels
+        self.support_size = 10
+        self.input_shape = observation_shape
+        self.num_actions = action_space_size
+        self.training = training
+        self.num_res_blocks = num_blocks
+        self.init = 'he_normal'
+        self.input_ph = tf.placeholder(tf.float32, (None,)+self.input_shape, 'input_img')
+        self.hidden_ph = tf.placeholder(tf.float32, (None,) + (self.num_channels,
+                                                               self.input_shape[0],
+                                                               self.input_shape[1]), 'input_hidden')
+        self.action_ph = tf.placeholder(tf.float32, (None,) + (self.num_actions,), 'input_action')
+
+        self.representation_model = self.get_representation_model(self.input_shape)
+        self.prediction_model = self.get_prediction_model()
+        self.dynamics_model = self.get_dynamics_model()
+
+        self.representation = self.representation_model(self.input_ph)
+        self.representation_normed = self.normalize_representation(self.hidden_ph)
+        self.policy, self.value = self.prediction_model(self.hidden_ph)
+        self.support_ph = tf.placeholder(tf.float32, (None, int(2*self.support_size + 1)), 'input_support')
+        self.scalar_out = support_to_scalar(self.support_ph, self.support_size)
+
+        self.extended_state = self.concat_state_and_action(self.hidden_ph, self.action_ph)
+        self.next_state, self.next_reward = self.dynamics_model(self.extended_state)
 
 
-def conv3x3(in_channels, out_channels, stride=1):
-    return torch.nn.Conv2d(
-        in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False
-    )
+        # self.hidden_t,self.policy_t,self.value_t = self.initial_inference_symbolic(self.input_ph, training = training)
+        # self.next_hidden_t,self.reward_t, self.next_policy_t, self.next_value_t = self.recurrent_inference_symbolic(self.hidden_ph,
+        #                                                                                                   self.action_ph, training = training)
+        #
+        # self.hidden_t_scalar, self.policy_t_scalar, self.value_t_scalar = self.initial_inference_symbolic_scalar(self.input_ph, training = training)
+        # self.next_hidden_t_scalar, self.reward_t_scalar, self.next_policy_t_scalar, self.next_value_t_scalar = self.recurrent_inference_symbolic_scalar(
+        #     self.hidden_ph,
+        #     self.action_ph, training = training)
+        # self.variables = rtfu.TensorFlowVariables(c, sess)
+        tmp_w = self.get_weights()
+        self.sess.run(tf.compat.v1.global_variables_initializer())
+        self.set_weights(tmp_w)
+
+        self.steps_trained = 0
 
 
-# Residual block
-class ResidualBlock(torch.nn.Module):
-    def __init__(self, num_channels, stride=1):
-        super().__init__()
-        self.conv1 = conv3x3(num_channels, num_channels, stride)
-        self.bn1 = torch.nn.BatchNorm2d(num_channels)
-        self.conv2 = conv3x3(num_channels, num_channels)
-        self.bn2 = torch.nn.BatchNorm2d(num_channels)
+    def get_representation_model(self,in_shape):
+        import tensorflow as tf
+        inp = tf.keras.layers.Input(in_shape)
+        x = inp
+        x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3,3),
+                                        strides=(1,1), padding='same', use_bias=False,
+                                   kernel_initializer=self.init,data_format='channels_first')(x)
+        x = tf.keras.layers.BatchNormalization(axis=1, momentum=0.1, epsilon=1e-5)(x, training=self.training)
+        x = tf.keras.layers.Activation('relu')(x)
+        # x = tf.keras.layers.LeakyReLU()(x)
+        for _ in range(self.num_res_blocks):
+            x_in = x
+            x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                       strides=(1, 1), padding='same', use_bias=False,
+                                       kernel_initializer=self.init,data_format='channels_first')(x)
+            x = tf.keras.layers.BatchNormalization(axis=1, momentum=0.1, epsilon=1e-5)(x, training=self.training)
+            x = tf.keras.layers.Activation('relu')(x)
+            # x = tf.keras.layers.Dropout(0.05)(x, training=self.training)
+            x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                       strides=(1, 1), padding='same', use_bias=False,
+                                       kernel_initializer=self.init,data_format='channels_first')(x)
+            x = tf.keras.layers.BatchNormalization(axis=1,momentum=0.1, epsilon=1e-5)(x, training=self.training)
+            x = x_in + x
+            x = tf.keras.layers.Activation('relu')(x)
+        h=x
+        # h = self.normalize_representation(x)
+        model = tf.keras.models.Model(inp, h)
+        return model
 
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = torch.nn.functional.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out += x
-        out = torch.nn.functional.relu(out)
+    def get_prediction_model(self):
+        import tensorflow as tf
+        inp = tf.keras.layers.Input([self.num_channels,self.input_shape[0], self.input_shape[1]])
+        x = inp
+        for _ in range(self.num_res_blocks):
+            x_in = x
+            x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                       strides=(1, 1), padding='same', use_bias=False,
+                                       kernel_initializer=self.init,data_format='channels_first')(x)
+            x = tf.keras.layers.BatchNormalization(axis=1, momentum=0.1, epsilon=1e-5)(x, training=self.training)
+            x = tf.keras.layers.Activation('relu')(x)
+            # x = tf.keras.layers.Dropout(0.05)(x, training=self.training)
+            x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                       strides=(1, 1), padding='same', use_bias=False,
+                                       kernel_initializer=self.init,data_format='channels_first')(x)
+            x = tf.keras.layers.BatchNormalization(axis=1, momentum=0.1, epsilon=1e-5)(x, training=self.training)
+            x = x_in + x
+            x = tf.keras.layers.Activation('relu')(x)
+        value_x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(1,1), strides=(1, 1),
+                                         kernel_initializer=self.init,data_format='channels_first')(x)
+        policy_x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(1,1), strides=(1, 1),
+                                          kernel_initializer=self.init,data_format='channels_first')(x)
+
+        value_x = tf.keras.layers.Flatten()(value_x)
+        # value_x = tf.keras.layers.Dropout(0.05)(value_x, training=self.training)
+        policy_x = tf.keras.layers.Flatten()(policy_x)
+        # policy_x = tf.keras.layers.Dropout(0.05)(policy_x, training=self.training)
+
+        value_x = tf.keras.layers.Dense(int(self.num_channels/2),
+                                        kernel_initializer=self.init)(value_x)
+        value_x = tf.keras.layers.ELU()(value_x)
+        value = tf.keras.layers.Dense(2*self.support_size+1)(value_x)
+
+        policy_x = tf.keras.layers.Dense(int(self.num_channels/2),
+                                         kernel_initializer=self.init)(policy_x)
+        policy_x = tf.keras.layers.ELU()(policy_x)
+        policy = tf.keras.layers.Dense(self.num_actions,
+                                       kernel_initializer=self.init)(policy_x)
+
+        model = tf.keras.models.Model(inp, [policy, value])
+
+        return model
+
+    def normalize_representation(self,rep):
+        import tensorflow as tf
+        min_encoded_state = tf.reduce_min(tf.reduce_min(rep, axis=1, keepdims=True), axis=2, keepdims=True)
+        max_encoded_state = tf.reduce_max(tf.reduce_max(rep, axis=1, keepdims=True), axis=2, keepdims=True)
+
+        scale_encoded_state = max_encoded_state - min_encoded_state
+        less_mask = tf.cast(tf.less(scale_encoded_state, 1e-5), tf.float32)
+        scale_encoded_state += less_mask*1e-5
+        rep_normalized = (rep - min_encoded_state) / scale_encoded_state
+        return rep_normalized
+
+    def get_dynamics_model(self):
+        import tensorflow as tf
+        inp = tf.keras.layers.Input([self.num_channels+1,self.input_shape[0],self.input_shape[1]])
+        x = inp
+        x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                        strides=(1, 1), padding='same', use_bias=False,
+                                   kernel_initializer=self.init,data_format='channels_first')(x)
+        x = tf.keras.layers.BatchNormalization(axis=1,momentum=0.1, epsilon=1e-5)(x, training=self.training)
+        x = tf.keras.layers.Activation('relu')(x)
+        # x = tf.keras.layers.LeakyReLU()(x)
+        for _ in range(self.num_res_blocks):
+            # x = ResidualBlock(self.num_channels, (1, 1))(x, training = self.training)
+            x_in = x
+            x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                       strides=(1, 1), padding='same', use_bias=False,
+                                       kernel_initializer=self.init,data_format='channels_first')(x)
+            x = tf.keras.layers.BatchNormalization(axis=1, momentum=0.1, epsilon=1e-5)(x, training=self.training)
+            x = tf.keras.layers.Activation('relu')(x)
+            # x = tf.keras.layers.Dropout(0.05)(x, training=self.training)
+            # x = tf.keras.layers.LeakyReLU()(x)
+            x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(3, 3),
+                                       strides=(1, 1), padding='same', use_bias=False,
+                                       kernel_initializer=self.init,data_format='channels_first')(x)
+            x = tf.keras.layers.BatchNormalization(axis=1, momentum=0.1, epsilon=1e-5)(x, training=self.training)
+            x = x_in + x
+            # state = tf.keras.layers.Activation('sigmoid')(x)
+            x = tf.keras.layers.Activation('relu')(x)
+            # x = tf.keras.layers.LeakyReLU()(x)
+
+        state = x
+        # state = self.normalize_representation(x)
+        x = tf.keras.layers.Conv2D(self.num_channels, kernel_size=(1, 1),
+                                   kernel_initializer=self.init,data_format='channels_first')(x)
+        x = tf.keras.layers.Flatten()(x)
+        # x = tf.keras.layers.Dropout(0.05)(x, training=self.training)
+
+        x = tf.keras.layers.Dense(int(self.num_channels/2), kernel_initializer=self.init)(x)
+        x = tf.keras.layers.ELU()(x)
+        # x = tf.keras.layers.ReLU()(x)
+        # reward = tf.keras.layers.Dense(1,activation='sigmoid',kernel_initializer='glorot_normal')(x)
+        reward = tf.keras.layers.Dense(2*self.support_size+1)(x)
+        model = tf.keras.models.Model(inp, [state, reward])
+        return model
+
+    def prediction_symbolic(self, encoded_state, training):
+        policy, value = self.prediction_model(encoded_state, training=training)
+        return policy, value
+
+    def prediction_symbolic_scalar(self, encoded_state, training):
+        policy, value = self.prediction_symbolic(encoded_state, training=training)
+        value = support_to_scalar(value, self.support_size)
+        return policy, value
+
+    def representation_symbolic(self, state_t, training):
+        encoded_state = self.representation_model(state_t, training=training)
+        encoded_state = self.normalize_representation(encoded_state)
+        return encoded_state
+
+    def dynamics_symbolic(self, encoded_state_t, action_t, training):
+        import tensorflow as tf
+        action_reshaped = tf.reshape(action_t, shape=(-1, 1, 3, 3))
+
+        dynam_inp = tf.concat(values=[encoded_state_t, action_reshaped], axis=1)
+        next_encoded_state, reward = self.dynamics_model(dynam_inp,training=training)
+        next_encoded_state = self.normalize_representation(next_encoded_state)
+        return next_encoded_state, reward
+
+    def dynamics_symbolic_scalar(self,encoded_state_t,action_t,training):
+        next_encoded_state, reward = self.dynamics_symbolic(encoded_state_t,action_t,training=training)
+        reward = support_to_scalar(reward, self.support_size)
+        return next_encoded_state, reward
+
+    def initial_inference_symbolic(self,inp_t,training):
+
+        encoded_state_t = self.representation_symbolic(inp_t,training=training)
+        policy_logits_t, value_t = self.prediction_symbolic(encoded_state_t,training=training)
+        return encoded_state_t, policy_logits_t, value_t
+
+    def initial_inference_symbolic_scalar(self, inp_t, training):
+        encoded_state_t = self.representation_symbolic(inp_t,training=training)
+        policy_logits_t, value_t = self.prediction_symbolic_scalar(encoded_state_t,training=training)
+        return encoded_state_t, policy_logits_t, value_t
+
+    def recurrent_inference_symbolic(self,hidden_tensor,action_tensor,training):
+        h_tensor,r_tensor = self.dynamics_symbolic(hidden_tensor,action_tensor,training=training)
+        policy_t,value_t = self.prediction_symbolic(h_tensor,training=training)
+        return h_tensor, r_tensor, policy_t, value_t
+
+    def recurrent_inference_symbolic_scalar(self,hidden_tensor,action_tensor,training):
+        h_tensor,r_tensor = self.dynamics_symbolic_scalar(hidden_tensor,action_tensor,training=training)
+        policy_t,value_t = self.prediction_symbolic_scalar(h_tensor,training=training)
+        return h_tensor, r_tensor, policy_t, value_t
+    #
+    # def initial_inference(self, image):
+    #     # representation + prediction function
+    #     # if len(image.shape)==len(self.input_shape):
+    #     # image = np.expand_dims(image,axis = 0)
+    #     hidden, policy, value = self.sess.run([self.hidden_t_scalar,self.policy_t_scalar,self.value_t_scalar],
+    #                                         {self.input_ph:image})
+    #
+    #     return (value[0,0], 0, policy, hidden)
+
+    # def initial_inference_batch(self, image):
+    # # representation + prediction function
+    #     # if len(image.shape)==len(self.input_shape):
+    #     hidden, policy, value = self.sess.run([self.hidden_t_scalar, self.policy_t_scalar, self.value_t_scalar],
+    #                                           {self.input_ph: image})
+    #     return value,0,policy,hidden
+
+    # def recurrent_inference(self, hidden_state, action):
+    #     # dynamics + prediction function
+    #     # hidden_state = np.expand_dims(hidden_state,axis = 0)
+    #     # action_in = np.zeros([1,self.num_actions])
+    #     # action_in[0,int(action)] = 1
+    #     action_in = np.full((1,self.num_actions), float(action)/self.num_actions)
+    #     next_hidden, next_reward, policy, value = self.sess.run([self.next_hidden_t_scalar, self.reward_t_scalar,
+    #                                                              self.next_policy_t_scalar, self.next_value_t_scalar],
+    #                                                             {self.hidden_ph: hidden_state,
+    #                                                              self.action_ph: action_in})
+    #     return value[0,0],next_reward[0,0],policy,next_hidden
+
+    def get_representation(self,state_in):
+        rep = self.sess.run(self.representation, {self.input_ph:state_in})
+        rep = self.sess.run(self.representation_normed, {self.hidden_ph: rep})
+        return rep
+
+    def get_prediction(self,repr):
+        policy, value = self.sess.run([self.policy, self.value], {self.hidden_ph: repr})
+        return policy,value
+
+    def support_to_scalar_run(self, supp_in):
+        out = self.sess.run(self.scalar_out, {self.support_ph: supp_in})
         return out
 
 
-# Downsample observations before representation network (See paper appendix Network Architecture)
-class DownSample(torch.nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv1 = torch.nn.Conv2d(
-            in_channels,
-            out_channels // 2,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            bias=False,
-        )
-        self.resblocks1 = torch.nn.ModuleList(
-            [ResidualBlock(out_channels // 2) for _ in range(2)]
-        )
-        self.conv2 = torch.nn.Conv2d(
-            out_channels // 2,
-            out_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            bias=False,
-        )
-        self.resblocks2 = torch.nn.ModuleList(
-            [ResidualBlock(out_channels) for _ in range(3)]
-        )
-        self.pooling1 = torch.nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
-        self.resblocks3 = torch.nn.ModuleList(
-            [ResidualBlock(out_channels) for _ in range(3)]
-        )
-        self.pooling2 = torch.nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
+    def initial_inference(self, image):
+        # representation + prediction function
+        # if len(image.shape)==len(self.input_shape):
+        # image = np.expand_dims(image,axis = 0)
 
-    def forward(self, x):
-        x = self.conv1(x)
-        for block in self.resblocks1:
-            x = block(x)
-        x = self.conv2(x)
-        for block in self.resblocks2:
-            x = block(x)
-        x = self.pooling1(x)
-        for block in self.resblocks3:
-            x = block(x)
-        x = self.pooling2(x)
-        return x
+        hidden = self.get_representation(image)
+        policy, value = self.get_prediction(hidden)
+        value = self.support_to_scalar_run(value)
+        return value[0, 0], 0, policy, hidden
+
+    def concat_state_and_action(self, encoded_state_t, action_t):
+        import tensorflow as tf
+        action_reshaped = tf.reshape(action_t, shape=(-1, 1, 3, 3))
+        dynam_inp = tf.concat(values=[encoded_state_t, action_reshaped], axis=1)
+        return dynam_inp
+
+    def recurrent_inference(self, hidden_state, action):
+        # dynamics + prediction function
+        # hidden_state = np.expand_dims(hidden_state,axis = 0)
+        # action_in = np.zeros([1,self.num_actions])
+        # action_in[0,int(action)] = 1
+        action_in = np.full((1,self.num_actions), float(action)/self.num_actions)
+        next_state, next_reward = self.sess.run([self.next_state, self.next_reward],
+                                                {self.hidden_ph: hidden_state,
+                                                 self.action_ph: action_in})
+        next_state = self.sess.run(self.representation_normed, {self.hidden_ph: next_state})
+        next_policy, next_value = self.get_prediction(next_state)
+        next_value = self.support_to_scalar_run(next_value)
+        next_reward = self.support_to_scalar_run(next_reward)
+        return next_value[0,0], next_reward[0,0], next_policy, next_state
 
 
-class DownsampleCNN(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, h_w):
-        super().__init__()
-        mid_channels = (in_channels + out_channels) // 2
-        self.features = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                in_channels, mid_channels, kernel_size=h_w[0] * 2, stride=4, padding=2
-            ),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d(kernel_size=3, stride=2),
-            torch.nn.Conv2d(mid_channels, out_channels, kernel_size=5, padding=2),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d(kernel_size=3, stride=2),
-        )
-        self.avgpool = torch.nn.AdaptiveAvgPool2d(h_w)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        return x
 
 
-class RepresentationNetwork(torch.nn.Module):
-    def __init__(
-        self,
-        observation_shape,
-        stacked_observations,
-        num_blocks,
-        num_channels,
-        downsample,
-    ):
-        super().__init__()
-        self.downsample = downsample
-        if self.downsample:
-            if self.downsample == "resnet":
-                self.downsample_net = DownSample(
-                    observation_shape[0] * (stacked_observations + 1)
-                    + stacked_observations,
-                    num_channels,
-                )
-            elif self.downsample == "CNN":
-                self.downsample_net = DownsampleCNN(
-                    observation_shape[0] * (stacked_observations + 1)
-                    + stacked_observations,
-                    num_channels,
-                    (
-                        math.ceil(observation_shape[1] / 16),
-                        math.ceil(observation_shape[2] / 16),
-                    ),
-                )
-            else:
-                raise NotImplementedError('downsample should be "resnet" or "CNN".')
-        self.conv = conv3x3(
-            observation_shape[0] * (stacked_observations + 1) + stacked_observations,
-            num_channels,
-        )
-        self.bn = torch.nn.BatchNorm2d(num_channels)
-        self.resblocks = torch.nn.ModuleList(
-            [ResidualBlock(num_channels) for _ in range(num_blocks)]
-        )
+    def get_weights(self):
+        # self.variables.get_weights()
+        return [self.representation_model.get_weights(),
+                self.prediction_model.get_weights(),
+                self.dynamics_model.get_weights()]
 
-    def forward(self, x):
-        if self.downsample:
-            x = self.downsample_net(x)
-        else:
-            x = self.conv(x)
-            x = self.bn(x)
-            x = torch.nn.functional.relu(x)
+    def set_weights(self, weights_list):
+        # self.variables.set_weights(weights)
+        self.representation_model.set_weights(weights_list[0])
+        self.prediction_model.set_weights(weights_list[1])
+        self.dynamics_model.set_weights(weights_list[2])
 
-        for block in self.resblocks:
-            x = block(x)
-        return x
+    def training_steps(self) -> int:
+        # How many steps / batches the network has been trained for.
+        return self.steps_trained
 
+    def set_training_steps(self,s) -> int:
+        self.steps_trained = s
+        return 0
 
-class DynamicsNetwork(torch.nn.Module):
-    def __init__(
-        self,
-        num_blocks,
-        num_channels,
-        reduced_channels_reward,
-        fc_reward_layers,
-        full_support_size,
-        block_output_size_reward,
-    ):
-        super().__init__()
-        self.conv = conv3x3(num_channels, num_channels - 1)
-        self.bn = torch.nn.BatchNorm2d(num_channels - 1)
-        self.resblocks = torch.nn.ModuleList(
-            [ResidualBlock(num_channels - 1) for _ in range(num_blocks)]
-        )
-
-        self.conv1x1_reward = torch.nn.Conv2d(
-            num_channels - 1, reduced_channels_reward, 1
-        )
-        self.block_output_size_reward = block_output_size_reward
-        self.fc = mlp(
-            self.block_output_size_reward, fc_reward_layers, full_support_size,
-        )
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = torch.nn.functional.relu(x)
-        for block in self.resblocks:
-            x = block(x)
-        state = x
-        x = self.conv1x1_reward(x)
-        x = x.view(-1, self.block_output_size_reward)
-        reward = self.fc(x)
-        return state, reward
-
-
-class PredictionNetwork(torch.nn.Module):
-    def __init__(
-        self,
-        action_space_size,
-        num_blocks,
-        num_channels,
-        reduced_channels_value,
-        reduced_channels_policy,
-        fc_value_layers,
-        fc_policy_layers,
-        full_support_size,
-        block_output_size_value,
-        block_output_size_policy,
-    ):
-        super().__init__()
-        self.resblocks = torch.nn.ModuleList(
-            [ResidualBlock(num_channels) for _ in range(num_blocks)]
-        )
-
-        self.conv1x1_value = torch.nn.Conv2d(num_channels, reduced_channels_value, 1)
-        self.conv1x1_policy = torch.nn.Conv2d(num_channels, reduced_channels_policy, 1)
-        self.block_output_size_value = block_output_size_value
-        self.block_output_size_policy = block_output_size_policy
-        self.fc_value = mlp(
-            self.block_output_size_value, fc_value_layers, full_support_size
-        )
-        self.fc_policy = mlp(
-            self.block_output_size_policy, fc_policy_layers, action_space_size,
-        )
-
-    def forward(self, x):
-        for block in self.resblocks:
-            x = block(x)
-        value = self.conv1x1_value(x)
-        policy = self.conv1x1_policy(x)
-        value = value.view(-1, self.block_output_size_value)
-        policy = policy.view(-1, self.block_output_size_policy)
-        value = self.fc_value(value)
-        policy = self.fc_policy(policy)
-        return policy, value
-
-
-class MuZeroResidualNetwork(AbstractNetwork):
-    def __init__(
-        self,
-        observation_shape,
-        stacked_observations,
-        action_space_size,
-        num_blocks,
-        num_channels,
-        reduced_channels_reward,
-        reduced_channels_value,
-        reduced_channels_policy,
-        fc_reward_layers,
-        fc_value_layers,
-        fc_policy_layers,
-        support_size,
-        downsample,
-    ):
-        super().__init__()
-        self.action_space_size = action_space_size
-        self.full_support_size = 2 * support_size + 1
-        block_output_size_reward = (
-            (
-                reduced_channels_reward
-                * math.ceil(observation_shape[1] / 16)
-                * math.ceil(observation_shape[2] / 16)
-            )
-            if downsample
-            else (reduced_channels_reward * observation_shape[1] * observation_shape[2])
-        )
-
-        block_output_size_value = (
-            (
-                reduced_channels_value
-                * math.ceil(observation_shape[1] / 16)
-                * math.ceil(observation_shape[2] / 16)
-            )
-            if downsample
-            else (reduced_channels_value * observation_shape[1] * observation_shape[2])
-        )
-
-        block_output_size_policy = (
-            (
-                reduced_channels_policy
-                * math.ceil(observation_shape[1] / 16)
-                * math.ceil(observation_shape[2] / 16)
-            )
-            if downsample
-            else (reduced_channels_policy * observation_shape[1] * observation_shape[2])
-        )
-
-        self.representation_network = torch.nn.DataParallel(
-            RepresentationNetwork(
-                observation_shape,
-                stacked_observations,
-                num_blocks,
-                num_channels,
-                downsample,
-            )
-        )
-
-        self.dynamics_network = torch.nn.DataParallel(
-            DynamicsNetwork(
-                num_blocks,
-                num_channels + 1,
-                reduced_channels_reward,
-                fc_reward_layers,
-                self.full_support_size,
-                block_output_size_reward,
-            )
-        )
-
-        self.prediction_network = torch.nn.DataParallel(
-            PredictionNetwork(
-                action_space_size,
-                num_blocks,
-                num_channels,
-                reduced_channels_value,
-                reduced_channels_policy,
-                fc_value_layers,
-                fc_policy_layers,
-                self.full_support_size,
-                block_output_size_value,
-                block_output_size_policy,
-            )
-        )
-
-    def prediction(self, encoded_state):
-        policy, value = self.prediction_network(encoded_state)
-        return policy, value
-
-    def representation(self, observation):
-        encoded_state = self.representation_network(observation)
-
-        # Scale encoded state between [0, 1] (See appendix paper Training)
-        min_encoded_state = (
-            encoded_state.view(
-                -1,
-                encoded_state.shape[1],
-                encoded_state.shape[2] * encoded_state.shape[3],
-            )
-            .min(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
-        max_encoded_state = (
-            encoded_state.view(
-                -1,
-                encoded_state.shape[1],
-                encoded_state.shape[2] * encoded_state.shape[3],
-            )
-            .max(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
-        scale_encoded_state = max_encoded_state - min_encoded_state
-        scale_encoded_state[scale_encoded_state < 1e-5] += 1e-5
-        encoded_state_normalized = (
-            encoded_state - min_encoded_state
-        ) / scale_encoded_state
-        return encoded_state_normalized
-
-    def dynamics(self, encoded_state, action):
-        # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)
-        action_one_hot = (
-            torch.ones(
-                (
-                    encoded_state.shape[0],
-                    1,
-                    encoded_state.shape[2],
-                    encoded_state.shape[3],
-                )
-            )
-            .to(action.device)
-            .float()
-        )
-        action_one_hot = (
-            action[:, :, None, None] * action_one_hot / self.action_space_size
-        )
-        x = torch.cat((encoded_state, action_one_hot), dim=1)
-        next_encoded_state, reward = self.dynamics_network(x)
-
-        # Scale encoded state between [0, 1] (See paper appendix Training)
-        min_next_encoded_state = (
-            next_encoded_state.view(
-                -1,
-                next_encoded_state.shape[1],
-                next_encoded_state.shape[2] * next_encoded_state.shape[3],
-            )
-            .min(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
-        max_next_encoded_state = (
-            next_encoded_state.view(
-                -1,
-                next_encoded_state.shape[1],
-                next_encoded_state.shape[2] * next_encoded_state.shape[3],
-            )
-            .max(2, keepdim=True)[0]
-            .unsqueeze(-1)
-        )
-        scale_next_encoded_state = max_next_encoded_state - min_next_encoded_state
-        scale_next_encoded_state[scale_next_encoded_state < 1e-5] += 1e-5
-        next_encoded_state_normalized = (
-            next_encoded_state - min_next_encoded_state
-        ) / scale_next_encoded_state
-        return next_encoded_state_normalized, reward
-
-    def initial_inference(self, observation):
-        encoded_state = self.representation(observation)
-        policy_logits, value = self.prediction(encoded_state)
-        # reward equal to 0 for consistency
-        reward = torch.log(
-            (
-                torch.zeros(1, self.full_support_size)
-                .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
-                .repeat(len(observation), 1)
-                .to(observation.device)
-            )
-        )
-        return (
-            value,
-            reward,
-            policy_logits,
-            encoded_state,
-        )
-
-    def recurrent_inference(self, encoded_state, action):
-        next_encoded_state, reward = self.dynamics(encoded_state, action)
-        policy_logits, value = self.prediction(next_encoded_state)
-        return value, reward, policy_logits, next_encoded_state
-
-
-########### End ResNet ###########
-##################################
-
-
-def mlp(
-    input_size,
-    layer_sizes,
-    output_size,
-    output_activation=torch.nn.Identity,
-    activation=torch.nn.ELU,
-):
-    sizes = [input_size] + layer_sizes + [output_size]
-    layers = []
-    for i in range(len(sizes) - 1):
-        act = activation if i < len(sizes) - 2 else output_activation
-        layers += [torch.nn.Linear(sizes[i], sizes[i + 1]), act()]
-    return torch.nn.Sequential(*layers)
-
+    # def load_weights(self,path):
+    #     with open(path, 'rb') as f:
+    #         s, w = pickle.load(f)
+    #     self.set_weights(w)
+    #     self.set_training_steps(s)
 
 def support_to_scalar(logits, support_size):
+    import tensorflow as tf
     """
     Transform a categorical representation to a scalar
     See paper appendix Network Architecture
     """
     # Decode to a scalar
-    probabilities = torch.softmax(logits, dim=1)
-    support = (
-        torch.tensor([x for x in range(-support_size, support_size + 1)])
-        .expand(probabilities.shape)
-        .float()
-        .to(device=probabilities.device)
-    )
-    x = torch.sum(support * probabilities, dim=1, keepdim=True)
+    probabilities = tf.nn.softmax(logits, axis=-1)
+    idxes = np.arange(-support_size,support_size+1)
+    ids = tf.cast(tf.constant(idxes),tf.float32)
+    ids= tf.expand_dims(ids,axis = 0)
+    x = tf.reduce_sum(ids * probabilities, axis=-1, keepdims=True)
 
     # Invert the scaling (defined in https://arxiv.org/abs/1805.11593)
-    x = torch.sign(x) * (
-        ((torch.sqrt(1 + 4 * 0.001 * (torch.abs(x) + 1 + 0.001)) - 1) / (2 * 0.001))
-        ** 2
-        - 1
-    )
+    _x = (tf.sqrt(1 + 4 * 0.001 * (tf.abs(x) + 1 + 0.001)) - 1) / (2 * 0.001)
+    x = tf.sign(x) * (tf.square(_x)-1)
     return x
-
-
-def scalar_to_support(x, support_size):
-    """
-    Transform a scalar to a categorical representation with (2 * support_size + 1) categories
-    See paper appendix Network Architecture
-    """
-    # Reduce the scale (defined in https://arxiv.org/abs/1805.11593)
-    x = torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1) + 0.001 * x
-
-    # Encode on a vector
-    x = torch.clamp(x, -support_size, support_size)
-    floor = x.floor()
-    prob = x - floor
-    logits = torch.zeros(x.shape[0], x.shape[1], 2 * support_size + 1).to(x.device)
-    logits.scatter_(
-        2, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1)
-    )
-    indexes = floor + support_size + 1
-    prob = prob.masked_fill_(2 * support_size < indexes, 0.0)
-    indexes = indexes.masked_fill_(2 * support_size < indexes, 0.0)
-    logits.scatter_(2, indexes.long().unsqueeze(-1), prob.unsqueeze(-1))
-    return logits

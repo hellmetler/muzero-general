@@ -270,7 +270,8 @@ class ReplayBuffer:
                 actions.append(game_history.action_history[current_index])
             elif current_index == len(game_history.root_values):
                 target_values.append(0)
-                target_rewards.append(game_history.reward_history[current_index])
+                latest_trg_reward =game_history.reward_history[current_index]
+                target_rewards.append(latest_trg_reward)
                 # Uniform policy
                 target_policies.append(
                     [
@@ -282,7 +283,8 @@ class ReplayBuffer:
             else:
                 # States past the end of games are treated as absorbing states
                 target_values.append(0)
-                target_rewards.append(0)
+                latest_trg_reward = -latest_trg_reward
+                target_rewards.append(latest_trg_reward)
                 # Uniform policy
                 target_policies.append(
                     [
